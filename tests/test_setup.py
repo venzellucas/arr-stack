@@ -104,7 +104,16 @@ class HelperTests(unittest.TestCase):
             setup.creds_path().write_text("{not json")
             with self.assertRaises(setup.StepError):
                 setup.load_creds()
-            self.assertEqual(setup.connect(), 1)
+            self.assertEqual(setup.main(["setup.py", "connect"]), 1)
+            self.assertEqual(setup.main(["setup.py", "seed"]), 1)
+
+    def test_whole_writes_leave_no_temporary_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            setup.APPDATA = Path(tmp)
+            setup.save_creds({"a": 1})
+            setup.save_creds({"a": 2})
+            self.assertEqual(os.listdir(setup.setup_dir()), ["credentials.json"])
+            self.assertEqual(setup.load_creds(), {"a": 2})
 
 
 LISTS = {"/api/v1/library-folders": "library_folders", "/api/v1/downloaders": "downloaders",
@@ -116,8 +125,10 @@ class FakeApps:
 
     def __init__(self):
         self.calls = []
-        self.unreachable = 0  # how many next calls fail as if the app were still starting
+        self.unreachable = {}  # app -> how many next calls fail as if it were still starting
         self.qbit_password = None
+        self.qbit_ok, self.qbit_refused = (204, None), (401, "Unauthorized")  # qBittorrent 5.x
+        self.qbit_answer = None  # answers every sign-in when set
         self.jf = {"wizard_done": False, "password": None, "keys": [], "libs": []}
         self.ha = {"needs_setup": True, "password": None, "lists": {key: [] for key in LISTS.values()}}
         self.tests = {}  # list path -> (status, body) its Test answers
@@ -126,12 +137,14 @@ class FakeApps:
 
     def handle(self, base, method, path, body):
         self.calls.append((base, method, path))
-        if self.unreachable:
-            self.unreachable -= 1
+        if self.unreachable.get(base):
+            self.unreachable[base] -= 1
             raise setup.StepError(f"{method} {path}: connection refused")
         path, _, query = path.partition("?")
         if base == setup.QBITTORRENT and path == "/api/v2/auth/login":
-            return (204, None) if body["password"] == self.qbit_password else (200, "Fails.")
+            if self.qbit_answer:
+                return self.qbit_answer
+            return self.qbit_ok if body["password"] == self.qbit_password else self.qbit_refused
         if base == setup.JELLYFIN:
             return self.jellyfin(method, path, query, body)
         if base == setup.HOLYARRS:
@@ -231,22 +244,41 @@ class ConnectTests(unittest.TestCase):
         self.assertEqual(self.apps.calls, [])
 
     def test_qbittorrent_still_starting_is_waited_for(self):
-        self.apps.unreachable = 2
+        self.apps.unreachable = {setup.QBITTORRENT: 2}
+        self.assertEqual(setup.connect(), 0)
+        self.assertEqual(self.lists()["downloaders"], 1)
+
+    def test_older_qbittorrent_answers_are_understood(self):
+        self.apps.qbit_ok, self.apps.qbit_refused = (200, "Ok."), (200, "Fails.")
         self.assertEqual(setup.connect(), 0)
         self.assertEqual(self.lists()["downloaders"], 1)
 
     def test_a_changed_qbittorrent_password_is_tried_once_and_left_alone(self):
-        self.apps.qbit_password = "changed by hand"
+        for refused in ((401, "Unauthorized"), (200, "Fails.")):
+            with self.subTest(refused=refused):
+                self.tearDown()  # each case starts from a fresh install
+                self.setUp()
+                self.apps.qbit_password, self.apps.qbit_refused = "changed by hand", refused
+                self.assertEqual(setup.connect(), 0)
+                logins = [c for c in self.apps.calls if c[0] == setup.QBITTORRENT]
+                self.assertEqual(len(logins), 1)  # never retried: qBittorrent bans after 5 failures
+                self.assertEqual(self.lists()["downloaders"], 0)
+                self.assertTrue(self.creds()["holyarrs"]["done"])
+
+    def test_any_other_qbittorrent_answer_is_a_failure_and_a_rerun_resumes(self):
+        self.apps.qbit_answer = (503, "Service Unavailable")
+        self.assertEqual(setup.connect(), 1)
+        self.assertNotIn("done", self.creds()["holyarrs"])
+        self.apps.qbit_answer = None
         self.assertEqual(setup.connect(), 0)
-        logins = [c for c in self.apps.calls if c[0] == setup.QBITTORRENT]
-        self.assertEqual(len(logins), 1)  # never retried: qBittorrent bans after 5 failures
-        self.assertEqual(self.lists()["downloaders"], 0)
+        self.assertEqual(self.lists()["downloaders"], 1)
 
     def test_a_holyarrs_owner_made_elsewhere_is_left_alone(self):
         self.apps.ha.update(needs_setup=False, password="theirs")
         self.assertEqual(setup.connect(), 0)
         self.assertEqual(sum(self.lists().values()), 0)
         self.assertNotIn("holyarrs", self.creds())
+        self.assertFalse([c for c in self.apps.calls if c[0] == setup.QBITTORRENT])  # no sign-in spent
 
     def test_a_changed_holyarrs_password_is_left_alone(self):
         setup.remember(self.creds(), "holyarrs", username="admin", password="ours")
@@ -261,6 +293,19 @@ class ConnectTests(unittest.TestCase):
         self.assertEqual(self.apps.jf["keys"], [])
         self.assertEqual(self.lists()["media_servers"], 0)
         self.assertEqual(self.lists()["downloaders"], 1)
+
+    def test_a_changed_jellyfin_password_is_left_alone(self):
+        setup.remember(self.creds(), "jellyfin", username="admin", password="ours")
+        self.apps.jf.update(wizard_done=True, password="changed by hand")
+        self.assertEqual(setup.connect(), 0)
+        self.assertEqual(self.apps.jf["keys"], [])
+        self.assertEqual(self.lists()["media_servers"], 0)
+
+    def test_a_connected_jellyfin_is_not_touched_while_holyarrs_finishes(self):
+        setup.remember(self.creds(), "jellyfin", username="admin", password="x", api_key="kept-key", done=True)
+        self.assertEqual(setup.connect(), 0)
+        self.assertFalse([c for c in self.apps.calls if c[0] == setup.JELLYFIN])
+        self.assertEqual(self.apps.ha["lists"]["media_servers"][0]["token"], "kept-key")
 
     def test_a_torrent_site_that_is_down_only_warns(self):
         self.apps.tests["/api/v1/sources"] = (200, {"ok": False, "error": "timeout"})
@@ -287,12 +332,16 @@ class ConnectTests(unittest.TestCase):
         self.assertEqual(setup.connect(), 1)
         self.assertEqual(self.lists()["downloaders"], 0)
 
-    def test_one_apps_unexpected_error_does_not_stop_the_others(self):
+    def test_a_jellyfin_failure_holds_holyarrs_back_until_a_rerun(self):
         jellyfin = self.apps.jellyfin
         self.apps.jellyfin = lambda m, p, q, b: (200, {}) if p == "/Users/AuthenticateByName" else jellyfin(m, p, q, b)
         self.assertEqual(setup.connect(), 1)  # KeyError: no AccessToken
-        self.assertEqual(self.lists()["downloaders"], 1)
-        self.assertTrue(self.creds()["holyarrs"]["done"])
+        self.assertEqual(self.lists()["downloaders"], 1)  # the rest still ran
+        self.assertNotIn("done", self.creds()["holyarrs"])
+        self.apps.jellyfin = jellyfin
+        self.assertEqual(setup.connect(), 0)
+        self.assertEqual(self.lists(), {"library_folders": 2, "downloaders": 1, "media_servers": 1, "sources": 2})
+        self.assertTrue(self.creds()["holyarrs"]["done"] and self.creds()["jellyfin"]["done"])
 
     def test_a_2xx_answer_that_is_not_json_is_an_error(self):
         client = setup.Client("http://x")

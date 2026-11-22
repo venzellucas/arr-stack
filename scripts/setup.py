@@ -85,11 +85,31 @@ def private_dir():
     return folder
 
 
+def write_whole(path, text, owner=None):
+    """Write path so that even a crash or power cut leaves the old file or the new one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if owner:
+            os.chown(tmp, *owner)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    folder = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(folder)
+    finally:
+        os.close(folder)
+
+
 def save_creds(creds):
-    fd, tmp = tempfile.mkstemp(dir=private_dir(), prefix=".credentials.")
-    with os.fdopen(fd, "w") as handle:
-        json.dump(creds, handle, indent=2)
-    os.replace(tmp, creds_path())
+    private_dir()
+    write_whole(creds_path(), json.dumps(creds, indent=2))
 
 
 def remember(creds, app, **values):
@@ -152,12 +172,7 @@ def seed():
         return
     login = remember(load_creds(), "qbittorrent", username="admin", password=new_password())
     make_owned_dirs(conf.parent)
-    # Written whole, then renamed: a crash never leaves a half-written conf.
-    fd, tmp = tempfile.mkstemp(dir=conf.parent, prefix=".qBittorrent.conf.")
-    with os.fdopen(fd, "w") as handle:
-        handle.write(qbittorrent_conf(login["username"], login["password"]))
-    os.chown(tmp, PUID, PGID)
-    os.replace(tmp, conf)
+    write_whole(conf, qbittorrent_conf(login["username"], login["password"]), owner=(PUID, PGID))
     print("qBittorrent: password generated, downloads go to /data/downloads")
 
 
@@ -240,12 +255,15 @@ def check_qbittorrent(creds):
             if time.monotonic() > deadline:
                 raise
             time.sleep(3)
-    # Older versions answer 200 "Ok.", newer ones 204 with no body.
-    if status == 204 or (status == 200 and str(out).strip() == "Ok."):
+    # Older versions answer 200 "Ok." or "Fails.", newer ones 204 or 401.
+    answer = str(out).strip()
+    if status == 204 or (status == 200 and answer == "Ok."):
         print("qBittorrent: signs in with the generated password")
         return login
-    print(f"qBittorrent: the saved password no longer works ({status}); HolyArrs's Downloader is left for you")
-    return None
+    if status == 401 or (status == 200 and answer == "Fails."):
+        print("qBittorrent: the saved password no longer works; HolyArrs's Downloader is left for you")
+        return None
+    raise StepError(f"qBittorrent sign-in answered {status}: {answer[:120]}")
 
 
 def jellyfin_client(token=None):
@@ -324,7 +342,7 @@ def add_once(ha, path, key, what, match, body):
     return found["id"]
 
 
-def setup_holyarrs(creds, qbit_login, jellyfin_key):
+def setup_holyarrs(creds, jellyfin_key, jellyfin_failed=False):
     saved = creds.get("holyarrs", {})
     if saved.get("done"):
         print("HolyArrs: connected by an earlier run; left as it is")
@@ -349,6 +367,13 @@ def setup_holyarrs(creds, qbit_login, jellyfin_key):
         raise StepError("signing in did not return a session (is two-factor sign-in on?)")
     ha.headers["X-CSRF-Token"] = me["csrf"]
     problems = []
+    # Only now, with HolyArrs known to be ours: a refused qBittorrent sign-in
+    # counts towards its ban, so it is not spent on a HolyArrs left alone.
+    try:
+        qbit_login = check_qbittorrent(creds)
+    except StepError as error:
+        qbit_login = None
+        problems.append(f"qBittorrent did not answer as expected ({error})")
 
     for path, kind, label, _ in FOLDERS:
         add_once(ha, "/api/v1/library-folders", "library_folders", f"library folder {path}",
@@ -361,7 +386,7 @@ def setup_holyarrs(creds, qbit_login, jellyfin_key):
             lambda d: d.get("kind") == "qbittorrent" and d.get("url") == QBITTORRENT,
             {"name": "qBittorrent", "kind": "qbittorrent", "url": QBITTORRENT, "username": qbit_login["username"],
              "secret": qbit_login["password"], "category": "holyarrs", "allow_local_network": True})))
-    else:
+    elif not problems:
         print("HolyArrs: Downloader skipped (no working qBittorrent password)")
     if jellyfin_key:
         local.append(("Jellyfin", "/api/v1/media-servers", add_once(
@@ -369,6 +394,8 @@ def setup_holyarrs(creds, qbit_login, jellyfin_key):
             lambda m: m.get("kind") == "jellyfin" and m.get("url") == JELLYFIN,
             {"name": "Jellyfin", "kind": "jellyfin", "url": JELLYFIN, "token": jellyfin_key, "enabled": True,
              "on_import": True, "on_rename": True, "on_delete": True, "allow_local_network": True})))
+    elif jellyfin_failed:
+        problems.append("the media server waits for the Jellyfin failure above to be fixed")
     else:
         print("HolyArrs: media server skipped (no Jellyfin key)")
     for name, path, ident in local:
@@ -394,11 +421,7 @@ def setup_holyarrs(creds, qbit_login, jellyfin_key):
 
 
 def connect():
-    try:
-        creds = load_creds()
-    except StepError as error:
-        print(f"FAIL setup: {error}", file=sys.stderr)
-        return 1
+    creds = load_creds()
     failed = []
 
     def step(name, action):
@@ -409,10 +432,8 @@ def connect():
             failed.append(name)
             return None
 
-    holyarrs_done = creds.get("holyarrs", {}).get("done")
-    qbit_login = None if holyarrs_done else step("qBittorrent", lambda: check_qbittorrent(creds))
     jellyfin_key = step("Jellyfin", lambda: setup_jellyfin(creds))
-    step("HolyArrs", lambda: setup_holyarrs(creds, qbit_login, jellyfin_key))
+    step("HolyArrs", lambda: setup_holyarrs(creds, jellyfin_key, jellyfin_failed=bool(failed)))
     if creds_path().exists():
         print(f"Passwords and keys: {HOST_CONFIG_DIR}/stack-setup/credentials.json (root only)")
     if failed:
@@ -427,10 +448,14 @@ def main(argv):
     # One run at a time: two overlapping runs would race on credentials.json.
     with open(private_dir() / ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if argv[1] == "seed":
-            seed()
-            return 0
-        return connect()
+        try:
+            if argv[1] == "seed":
+                seed()
+                return 0
+            return connect()
+        except StepError as error:
+            print(f"FAIL setup: {error}", file=sys.stderr)
+            return 1
 
 
 if __name__ == "__main__":

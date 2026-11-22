@@ -1,6 +1,6 @@
 # HolyArrs, qBittorrent and Jellyfin on one Docker host.
 # Every setting has a default, so no .env file is needed. To override a value,
-# copy .env.example to .env (Compose reads it automatically) or export it.
+# copy .env.example to .env (Compose reads it automatically).
 
 name: media
 
