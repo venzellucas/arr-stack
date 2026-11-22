@@ -8,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("setup", Path(__file__).resolve().parents[1] / "scripts/setup.py")
@@ -35,8 +36,11 @@ class PasswordHashTests(unittest.TestCase):
         self.assertIn("[WebUI]\nUsername=admin\nPassword_PBKDF2=\"@ByteArray(", conf)
 
 
-class SeedTests(unittest.TestCase):
+class Isolated(unittest.TestCase):
+    """Points the setup at a temporary folder, never the host's, and restores it after."""
+
     def setUp(self):
+        self.saved_globals = setup.APPDATA, setup.DATA, setup.PUID, setup.PGID
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         setup.APPDATA, setup.DATA = root / "appdata", root / "data"
@@ -44,7 +48,11 @@ class SeedTests(unittest.TestCase):
         setup.PUID, setup.PGID = os.getuid(), os.getgid()
 
     def tearDown(self):
+        setup.APPDATA, setup.DATA, setup.PUID, setup.PGID = self.saved_globals
         self.tmp.cleanup()
+
+
+class SeedTests(Isolated):
 
     def test_fresh_seed_makes_folders_conf_and_saves_the_password_first(self):
         setup.seed()
@@ -81,7 +89,7 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(creds["jellyfin"], {"x": 1})
 
 
-class HelperTests(unittest.TestCase):
+class HelperTests(Isolated):
     def test_listed_needs_the_exact_key(self):
         self.assertEqual(setup.listed({"sources": [3]}, "sources", "sources"), [3])
         for bad in ({"items": [3]}, {"sources": None}, [3], None):
@@ -89,31 +97,32 @@ class HelperTests(unittest.TestCase):
                 setup.listed(bad, "sources", "sources")
 
     def test_remember_keeps_values_already_saved(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            setup.APPDATA = Path(tmp)
-            creds = {}
-            first = setup.remember(creds, "holyarrs", username="admin", password="one")
-            again = setup.remember(setup.load_creds(), "holyarrs", username="admin", password="two")
-            self.assertEqual(first["password"], "one")
-            self.assertEqual(again["password"], "one")
+        first = setup.remember({}, "holyarrs", username="admin", password="one")
+        again = setup.remember(setup.load_creds(), "holyarrs", username="admin", password="two")
+        self.assertEqual(first["password"], "one")
+        self.assertEqual(again["password"], "one")
 
     def test_corrupt_credentials_are_a_clear_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            setup.APPDATA = Path(tmp)
-            setup.private_dir()
-            setup.creds_path().write_text("{not json")
-            with self.assertRaises(setup.StepError):
-                setup.load_creds()
-            self.assertEqual(setup.main(["setup.py", "connect"]), 1)
-            self.assertEqual(setup.main(["setup.py", "seed"]), 1)
+        setup.private_dir()
+        setup.creds_path().write_text("{not json")
+        with self.assertRaises(setup.StepError):
+            setup.load_creds()
+        self.assertEqual(setup.main(["setup.py", "connect"]), 1)
+        self.assertEqual(setup.main(["setup.py", "seed"]), 1)
 
     def test_whole_writes_leave_no_temporary_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            setup.APPDATA = Path(tmp)
-            setup.save_creds({"a": 1})
-            setup.save_creds({"a": 2})
-            self.assertEqual(os.listdir(setup.setup_dir()), ["credentials.json"])
-            self.assertEqual(setup.load_creds(), {"a": 2})
+        setup.save_creds({"a": 1})
+        setup.save_creds({"a": 2})
+        self.assertEqual(sorted(os.listdir(setup.setup_dir())), ["credentials.json"])
+        self.assertEqual(setup.load_creds(), {"a": 2})
+
+    def test_a_failed_whole_write_keeps_the_old_file_and_no_temporary_one(self):
+        setup.save_creds({"a": 1})
+        with mock.patch.object(setup.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                setup.save_creds({"a": 2})
+        self.assertEqual(sorted(os.listdir(setup.setup_dir())), ["credentials.json"])
+        self.assertEqual(setup.load_creds(), {"a": 1})
 
 
 LISTS = {"/api/v1/library-folders": "library_folders", "/api/v1/downloaders": "downloaders",
@@ -202,10 +211,9 @@ class FakeApps:
         raise AssertionError(f"unexpected HolyArrs call {method} {path}")
 
 
-class ConnectTests(unittest.TestCase):
+class ConnectTests(Isolated):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        setup.APPDATA = Path(self.tmp.name)
+        super().setUp()
         self.apps = apps = FakeApps()
 
         class FakeClient(setup.Client):
@@ -219,7 +227,10 @@ class ConnectTests(unittest.TestCase):
 
     def tearDown(self):
         setup.Client, setup.WAIT, setup.time.sleep = self.saved
-        self.tmp.cleanup()
+        super().tearDown()
+
+    def sign_ins(self, base):
+        return [c for c in self.apps.calls if c[0] == base]
 
     def creds(self):
         return setup.load_creds()
@@ -264,6 +275,37 @@ class ConnectTests(unittest.TestCase):
                 self.assertEqual(len(logins), 1)  # never retried: qBittorrent bans after 5 failures
                 self.assertEqual(self.lists()["downloaders"], 0)
                 self.assertTrue(self.creds()["holyarrs"]["done"])
+
+    def test_qbittorrent_that_never_answers_fails_the_run(self):
+        self.apps.unreachable = {setup.QBITTORRENT: 10**6}
+        setup.WAIT = 0
+        self.assertEqual(setup.connect(), 1)
+        self.assertNotIn("done", self.creds()["holyarrs"])
+        self.assertEqual(self.lists()["downloaders"], 0)
+
+    def test_a_refused_password_is_never_tried_again(self):
+        # Jellyfin and HolyArrs changed by hand after an earlier, partial run.
+        setup.remember(self.creds(), "jellyfin", username="admin", password="ours")
+        setup.remember(self.creds(), "holyarrs", username="admin", password="ours")
+        self.apps.jf.update(wizard_done=True, password="changed by hand")
+        self.apps.ha.update(needs_setup=False, password="changed by hand")
+        self.assertEqual(setup.connect(), 0)
+        creds = self.creds()
+        self.assertTrue(creds["jellyfin"]["left_alone"] and creds["holyarrs"]["left_alone"])
+        self.apps.calls.clear()
+        self.assertEqual(setup.connect(), 0)
+        self.assertEqual(self.apps.calls, [])
+
+    def test_a_refused_qbittorrent_password_is_never_tried_again(self):
+        self.apps.qbit_password = "changed by hand"
+        self.apps.done_status = 500  # HolyArrs stays unfinished, so the next run comes back
+        self.assertEqual(setup.connect(), 1)
+        self.assertTrue(self.creds()["qbittorrent"]["left_alone"])
+        self.apps.done_status = 204
+        self.apps.calls.clear()
+        self.assertEqual(setup.connect(), 0)
+        self.assertEqual(self.sign_ins(setup.QBITTORRENT), [])
+        self.assertTrue(self.creds()["holyarrs"]["done"])
 
     def test_any_other_qbittorrent_answer_is_a_failure_and_a_rerun_resumes(self):
         self.apps.qbit_answer = (503, "Service Unavailable")
@@ -378,6 +420,8 @@ class EnvFileTests(unittest.TestCase):
             "#CONFIG_DIR=/commented\n": "/opt/appdata",
             "CONFIG_DIRS=/other\n": "/opt/appdata",
             "CONFIG_DIR=\n": "/opt/appdata",
+            "export CONFIG_DIR=/srv/exported\n": "/srv/exported",
+            "exportCONFIG_DIR=/srv/other\n": "/opt/appdata",
         }
         for env, expected in cases.items():
             with self.subTest(env=env):

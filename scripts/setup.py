@@ -126,6 +126,28 @@ def mark_done(creds, app):
     save_creds(creds)
 
 
+def leave_alone(creds, app, name):
+    """Remember that app refused its saved password, so no later run signs in again.
+
+    Repeated failed sign-ins lock accounts (Jellyfin) or ban the address (qBittorrent).
+    """
+    creds.setdefault(app, {})["left_alone"] = True
+    save_creds(creds)
+    print(f"{name}: the saved password was refused (changed by hand?); left as it is from now on. "
+          f"To try again, remove its \"{app}\" block from credentials.json")
+
+
+def skipped(saved, name):
+    """True, with a line saying why, when an earlier run finished with this app."""
+    if saved.get("done"):
+        print(f"{name}: connected by an earlier run; left as it is")
+    elif saved.get("left_alone"):
+        print(f"{name}: refused its saved password in an earlier run; left as it is")
+    else:
+        return False
+    return True
+
+
 def new_password():
     return secrets.token_urlsafe(24)
 
@@ -244,6 +266,8 @@ def check_qbittorrent(creds):
     if not login:
         print("qBittorrent: set up before this script; HolyArrs's Downloader is left for you")
         return None
+    if skipped(login, "qBittorrent"):
+        return None
     qb = Client(QBITTORRENT)
     deadline = time.monotonic() + WAIT
     while True:
@@ -261,7 +285,7 @@ def check_qbittorrent(creds):
         print("qBittorrent: signs in with the generated password")
         return login
     if status == 401 or (status == 200 and answer == "Fails."):
-        print("qBittorrent: the saved password no longer works; HolyArrs's Downloader is left for you")
+        leave_alone(creds, "qbittorrent", "qBittorrent")
         return None
     raise StepError(f"qBittorrent sign-in answered {status}: {answer[:120]}")
 
@@ -276,9 +300,8 @@ def jellyfin_client(token=None):
 def setup_jellyfin(creds):
     """Jellyfin's API key for HolyArrs, or None when Jellyfin is left as it is."""
     saved = creds.get("jellyfin", {})
-    if saved.get("done"):
-        print("Jellyfin: connected by an earlier run; left as it is")
-        return saved.get("api_key")
+    if skipped(saved, "Jellyfin"):
+        return saved.get("api_key") if saved.get("done") else None
     jf = jellyfin_client()
     info = jf.wait("/System/Info/Public")
     if not info.get("StartupWizardCompleted"):
@@ -296,7 +319,7 @@ def setup_jellyfin(creds):
     try:
         auth = jf.ok("POST", "/Users/AuthenticateByName", {"Username": login["username"], "Pw": login["password"]})
     except Refused:
-        print("Jellyfin: the saved password no longer works; left as it is")
+        leave_alone(creds, "jellyfin", "Jellyfin")
         return None
     jf = jellyfin_client(auth["AccessToken"])
     if not login.get("api_key"):
@@ -344,8 +367,7 @@ def add_once(ha, path, key, what, match, body):
 
 def setup_holyarrs(creds, jellyfin_key, jellyfin_failed=False):
     saved = creds.get("holyarrs", {})
-    if saved.get("done"):
-        print("HolyArrs: connected by an earlier run; left as it is")
+    if skipped(saved, "HolyArrs"):
         return
     # Host: localhost is always accepted and saves nothing, with or without a proxy.
     ha = Client(HOLYARRS, host="localhost")
@@ -358,7 +380,7 @@ def setup_holyarrs(creds, jellyfin_key, jellyfin_failed=False):
         try:
             me = ha.ok("POST", "/api/v1/auth/login", {"name": saved["username"], "password": saved["password"]})
         except Refused:
-            print("HolyArrs: the saved password no longer works; left as it is")
+            leave_alone(creds, "holyarrs", "HolyArrs")
             return
     else:
         print("HolyArrs: has an owner this script did not make; left as it is")

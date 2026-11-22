@@ -8,11 +8,11 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok:   $*"; }
 
 # A value from .env when present, else the same default as docker-compose.yml.
-# Read the way Compose reads it: the last line wins, spaces around the value
-# go, a quoted value is what is inside the quotes, and an unquoted value ends
-# at " #".
+# Read the way Compose reads it: an "export " prefix is allowed, the last line
+# wins, spaces around the value go, a quoted value is what is inside the
+# quotes, and an unquoted value ends at " #".
 setting() {
-  value=$(grep -E "^[[:space:]]*$1[[:space:]]*=" .env 2>/dev/null | tail -n 1)
+  value=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" .env 2>/dev/null | tail -n 1)
   value=$(printf '%s' "${value#*=}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
   case $value in
     \"*) value=$(printf '%s' "$value" | sed -E 's/^"([^"]*)".*/\1/') ;;
