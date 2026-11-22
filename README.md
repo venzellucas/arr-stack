@@ -55,9 +55,9 @@ Running `make up` again is safe. Once an app is connected it is marked done in t
 and never touched again, so later changes you make in its settings stay. A run that
 failed halfway picks up where it stopped. An app that was set up before this script, or
 whose generated password you changed before the connection finished, is reported and
-skipped: connect it in HolyArrs' Settings yourself. A refused password is remembered, so
-later runs do not keep failing to sign in (which can lock an account); to try that app
-again, remove its block from the credentials file.
+skipped: connect it in HolyArrs' Settings yourself. A refused password is remembered, and
+later runs no longer sign in to that app, since repeated failed sign-ins can lock an
+account.
 
 ## What stays manual
 

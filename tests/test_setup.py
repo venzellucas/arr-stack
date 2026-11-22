@@ -1,6 +1,8 @@
 import base64
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -289,9 +291,13 @@ class ConnectTests(Isolated):
         setup.remember(self.creds(), "holyarrs", username="admin", password="ours")
         self.apps.jf.update(wizard_done=True, password="changed by hand")
         self.apps.ha.update(needs_setup=False, password="changed by hand")
-        self.assertEqual(setup.connect(), 0)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(setup.connect(), 0)
         creds = self.creds()
         self.assertTrue(creds["jellyfin"]["left_alone"] and creds["holyarrs"]["left_alone"])
+        self.assertIn("Connect it in HolyArrs' Settings yourself", out.getvalue())
+        self.assertNotIn("credentials.json", out.getvalue().replace(
+            setup.HOST_CONFIG_DIR + "/stack-setup/credentials.json (root only)", ""))
         self.apps.calls.clear()
         self.assertEqual(setup.connect(), 0)
         self.assertEqual(self.apps.calls, [])

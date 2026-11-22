@@ -134,7 +134,7 @@ def leave_alone(creds, app, name):
     creds.setdefault(app, {})["left_alone"] = True
     save_creds(creds)
     print(f"{name}: the saved password was refused (changed by hand?); left as it is from now on. "
-          f"To try again, remove its \"{app}\" block from credentials.json")
+          f"Connect it in HolyArrs' Settings yourself")
 
 
 def skipped(saved, name):
