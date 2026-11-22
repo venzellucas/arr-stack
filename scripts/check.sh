@@ -8,8 +8,17 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok:   $*"; }
 
 # A value from .env when present, else the same default as docker-compose.yml.
+# Read the way Compose reads it: the last line wins, spaces around the value
+# go, a quoted value is what is inside the quotes, and an unquoted value ends
+# at " #".
 setting() {
-  value=$(sed -n "s/^[[:space:]]*$1=//p" .env 2>/dev/null | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")
+  value=$(grep -E "^[[:space:]]*$1[[:space:]]*=" .env 2>/dev/null | tail -n 1)
+  value=$(printf '%s' "${value#*=}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  case $value in
+    \"*) value=$(printf '%s' "$value" | sed -E 's/^"([^"]*)".*/\1/') ;;
+    \'*) value=$(printf '%s' "$value" | sed -E "s/^'([^']*)'.*/\\1/") ;;
+    *) value=$(printf '%s' "$value" | sed -E 's/^#.*//; s/[[:space:]]+#.*$//') ;;
+  esac
   echo "${value:-$2}"
 }
 
@@ -59,9 +68,11 @@ updater_on() {
   case ",$(setting COMPOSE_PROFILES '')," in *,updater,*) return 0 ;; *) return 1 ;; esac
 }
 
+# Only the path: the file's folder is readable by root only, so a normal user
+# could not even tell whether it exists.
 credentials() {
-  file="$(setting CONFIG_DIR /opt/appdata)/stack-setup/credentials.json"
-  if [ -f "$file" ]; then echo "$file"; else echo "no credentials yet ($file); run make up"; fi
+  echo "$(setting CONFIG_DIR /opt/appdata)/stack-setup/credentials.json"
+  echo "(made by make up; readable by root only: sudo cat it)"
 }
 
 case "${1:-all}" in

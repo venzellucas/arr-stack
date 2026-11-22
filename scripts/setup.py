@@ -9,17 +9,20 @@ connect  Once the apps answer: finish Jellyfin's first run, then make the
          HolyArrs owner and connect HolyArrs to qBittorrent, Jellyfin and two
          built-in torrent sites.
 
-Anything already set up is left as it is. Each generated password or key is
-saved to credentials.json before it is used, so a failed run can be resumed.
+Each generated password or key is saved to credentials.json before it is used,
+so a failed run can be resumed. An app this script finished is marked done and
+never touched again; an app set up some other way is left as it is.
 """
 
 import base64
+import fcntl
 import hashlib
 import http.cookiejar
 import json
 import os
 import secrets
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +40,7 @@ JELLYFIN = "http://jellyfin:8096"
 HOLYARRS = "http://holyarrs:6262"
 
 TIMEOUT = 30  # seconds per request
+TEST_TIMEOUT = 60  # HolyArrs gives a Test up to 30 s; leave it room to answer
 WAIT = 180  # seconds an app may take to become ready
 
 FOLDERS = (("/data/media/movies", "movie", "Movies", "movies"), ("/data/media/tv", "show", "TV", "tvshows"))
@@ -47,26 +51,45 @@ class StepError(Exception):
     """A request failed; the message names the request and its answer."""
 
 
+class Refused(StepError):
+    """A saved password was refused: the app was changed by hand since."""
+
+
 # --- credentials -----------------------------------------------------------
 
+def setup_dir():
+    return APPDATA / "stack-setup"
+
+
 def creds_path():
-    return APPDATA / "stack-setup" / "credentials.json"
+    return setup_dir() / "credentials.json"
 
 
 def load_creds():
     path = creds_path()
-    return json.loads(path.read_text()) if path.exists() else {}
+    if not path.exists():
+        return {}
+    try:
+        creds = json.loads(path.read_text())
+    except ValueError:
+        raise StepError(f"{HOST_CONFIG_DIR}/stack-setup/credentials.json is not valid JSON; fix or remove it") from None
+    if not isinstance(creds, dict):
+        raise StepError(f"{HOST_CONFIG_DIR}/stack-setup/credentials.json is not a JSON object; fix or remove it")
+    return creds
+
+
+def private_dir():
+    folder = setup_dir()
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(folder, 0o700)
+    return folder
 
 
 def save_creds(creds):
-    path = creds_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=private_dir(), prefix=".credentials.")
     with os.fdopen(fd, "w") as handle:
         json.dump(creds, handle, indent=2)
-    os.replace(tmp, path)
+    os.replace(tmp, creds_path())
 
 
 def remember(creds, app, **values):
@@ -76,6 +99,11 @@ def remember(creds, app, **values):
         entry.setdefault(key, value)
     save_creds(creds)
     return entry
+
+
+def mark_done(creds, app):
+    creds.setdefault(app, {})["done"] = True
+    save_creds(creds)
 
 
 def new_password():
@@ -124,10 +152,12 @@ def seed():
         return
     login = remember(load_creds(), "qbittorrent", username="admin", password=new_password())
     make_owned_dirs(conf.parent)
-    fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # Written whole, then renamed: a crash never leaves a half-written conf.
+    fd, tmp = tempfile.mkstemp(dir=conf.parent, prefix=".qBittorrent.conf.")
     with os.fdopen(fd, "w") as handle:
         handle.write(qbittorrent_conf(login["username"], login["password"]))
-    os.chown(conf, PUID, PGID)
+    os.chown(tmp, PUID, PGID)
+    os.replace(tmp, conf)
     print("qBittorrent: password generated, downloads go to /data/downloads")
 
 
@@ -141,7 +171,7 @@ class Client:
             self.headers["Host"] = host
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
-    def call(self, method, path, body=None, form=False):
+    def call(self, method, path, body=None, form=False, timeout=TIMEOUT):
         headers = dict(self.headers)
         data = None
         if body is not None:
@@ -149,7 +179,7 @@ class Client:
             headers["Content-Type"] = "application/x-www-form-urlencoded" if form else "application/json"
         request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
-            with self.opener.open(request, timeout=TIMEOUT) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as error:
             status, raw = error.code, error.read()
@@ -160,40 +190,41 @@ class Client:
         except ValueError:
             return status, raw.decode(errors="replace")
 
-    def ok(self, method, path, body=None, form=False):
-        status, out = self.call(method, path, body, form)
+    def ok(self, method, path, body=None, form=False, timeout=TIMEOUT):
+        """The JSON object a 2xx answer carries; anything else is a StepError."""
+        status, out = self.call(method, path, body, form, timeout)
+        if status in (401, 403) and path.endswith(("/auth/login", "/AuthenticateByName")):
+            raise Refused(f"the saved password was refused ({status})")
         if not 200 <= status < 300:
             raise StepError(f"{method} {path} answered {status}: {str(out)[:200]}")
+        if out is not None and not isinstance(out, (dict, list)):
+            raise StepError(f"{method} {path} answered {status} with something other than JSON: {str(out)[:120]}")
         return out
 
     def wait(self, path):
-        """GET path until it answers 2xx, or fail after WAIT seconds."""
+        """GET path until it answers 2xx JSON, or fail after WAIT seconds."""
         deadline = time.monotonic() + WAIT
         while True:
             try:
-                status, out = self.call("GET", path)
+                return self.ok("GET", path)
             except StepError as error:
-                status, out = 0, str(error)
-            if 200 <= status < 300:
-                return out
+                last = error
             if time.monotonic() > deadline:
-                raise StepError(f"GET {path} was not ready after {WAIT}s (last answer {status}: {str(out)[:120]})")
+                raise StepError(f"not ready after {WAIT}s: {last}")
             time.sleep(3)
 
 
-def items(out, *keys):
-    """The list in an API answer, whether bare or under one of keys."""
-    if isinstance(out, list):
-        return out
-    for key in keys:
-        if isinstance(out, dict) and isinstance(out.get(key), list):
-            return out[key]
-    return []
+def listed(out, key, what):
+    """The list HolyArrs or Jellyfin returns under key; a missing key is an error."""
+    if not isinstance(out, dict) or not isinstance(out.get(key), list):
+        raise StepError(f"unexpected answer listing {what}: no '{key}' list")
+    return out[key]
 
 
 # --- connect ---------------------------------------------------------------
 
 def check_qbittorrent(creds):
+    """The saved qBittorrent login if it still works, else None."""
     login = creds.get("qbittorrent")
     if not login:
         print("qBittorrent: set up before this script; HolyArrs's Downloader is left for you")
@@ -201,14 +232,20 @@ def check_qbittorrent(creds):
     qb = Client(QBITTORRENT)
     deadline = time.monotonic() + WAIT
     while True:
-        status, out = qb.call("POST", "/api/v2/auth/login", {"username": login["username"], "password": login["password"]}, form=True)
-        # Older versions answer 200 "Ok.", newer ones 204 with no body.
-        if status == 204 or (status == 200 and str(out).strip() == "Ok."):
-            print("qBittorrent: signs in with the generated password")
-            return login
-        if time.monotonic() > deadline:
-            raise StepError(f"sign-in with the saved password failed ({status}: {str(out)[:120]})")
-        time.sleep(3)
+        try:
+            status, out = qb.call("POST", "/api/v2/auth/login",
+                                  {"username": login["username"], "password": login["password"]}, form=True)
+            break
+        except StepError:  # not answering yet; a wrong password is never retried
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(3)
+    # Older versions answer 200 "Ok.", newer ones 204 with no body.
+    if status == 204 or (status == 200 and str(out).strip() == "Ok."):
+        print("qBittorrent: signs in with the generated password")
+        return login
+    print(f"qBittorrent: the saved password no longer works ({status}); HolyArrs's Downloader is left for you")
+    return None
 
 
 def jellyfin_client(token=None):
@@ -219,9 +256,13 @@ def jellyfin_client(token=None):
 
 
 def setup_jellyfin(creds):
+    """Jellyfin's API key for HolyArrs, or None when Jellyfin is left as it is."""
+    saved = creds.get("jellyfin", {})
+    if saved.get("done"):
+        print("Jellyfin: connected by an earlier run; left as it is")
+        return saved.get("api_key")
     jf = jellyfin_client()
     info = jf.wait("/System/Info/Public")
-    saved = creds.get("jellyfin", {})
     if not info.get("StartupWizardCompleted"):
         jf.wait("/Startup/Configuration")  # answers 503 while first-start migrations run
         login = remember(creds, "jellyfin", username="admin", password=new_password())
@@ -234,105 +275,144 @@ def setup_jellyfin(creds):
         print("Jellyfin: set up before this script; HolyArrs's media server is left for you")
         return None
     login = creds["jellyfin"]
-    auth = jf.ok("POST", "/Users/AuthenticateByName", {"Username": login["username"], "Pw": login["password"]})
+    try:
+        auth = jf.ok("POST", "/Users/AuthenticateByName", {"Username": login["username"], "Pw": login["password"]})
+    except Refused:
+        print("Jellyfin: the saved password no longer works; left as it is")
+        return None
     jf = jellyfin_client(auth["AccessToken"])
     if not login.get("api_key"):
-        if not any(k.get("AppName") == "HolyArrs" for k in items(jf.ok("GET", "/Auth/Keys"), "Items")):
+        keys = listed(jf.ok("GET", "/Auth/Keys"), "Items", "Jellyfin API keys")
+        if not any(k.get("AppName") == "HolyArrs" for k in keys):
             jf.ok("POST", "/Auth/Keys?" + urllib.parse.urlencode({"app": "HolyArrs"}))
-        key = next(k["AccessToken"] for k in items(jf.ok("GET", "/Auth/Keys"), "Items") if k.get("AppName") == "HolyArrs")
+            keys = listed(jf.ok("GET", "/Auth/Keys"), "Items", "Jellyfin API keys")
+        key = next((k.get("AccessToken") for k in keys if k.get("AppName") == "HolyArrs"), None)
+        if not key:
+            raise StepError("the API key for HolyArrs was not found after making it")
         login["api_key"] = key
         save_creds(creds)
-    libraries = items(jf.ok("GET", "/Library/VirtualFolders"))
+    libraries = jf.ok("GET", "/Library/VirtualFolders")
+    if not isinstance(libraries, list):
+        raise StepError("unexpected answer listing Jellyfin libraries")
     for path, _, label, collection in FOLDERS:
         if not any(path in lib.get("Locations", []) for lib in libraries):
             query = urllib.parse.urlencode({"name": label, "collectionType": collection, "refreshLibrary": "false"})
             jf.ok("POST", "/Library/VirtualFolders?" + query, {"LibraryOptions": {"PathInfos": [{"Path": path}]}})
             print(f"Jellyfin: library {label} added ({path})")
+    mark_done(creds, "jellyfin")
     return login["api_key"]
 
 
-def test(ha, path, ident, name):
-    status, out = ha.call("POST", f"{path}/{ident}/test")
-    passed = 200 <= status < 300 and (not isinstance(out, dict) or out.get("ok", True))
-    if not passed:
-        raise StepError(f"{name} was added but its Test failed ({status}: {str(out)[:160]})")
-    print(f"HolyArrs: {name} passes Test")
+def passes_test(ha, path, ident):
+    """(passed, why) for HolyArrs' own Test of one item."""
+    try:
+        status, out = ha.call("POST", f"{path}/{ident}/test", timeout=TEST_TIMEOUT)
+    except StepError as error:
+        return False, str(error)
+    passed = 200 <= status < 300 and (not isinstance(out, dict) or out.get("ok", True) is not False)
+    return passed, f"{status}: {str(out)[:160]}"
 
 
-def setup_holyarrs(creds, qbit, jellyfin_key):
+def add_once(ha, path, key, what, match, body):
+    """The id of the item in HolyArrs that match() picks, adding body if none."""
+    found = next((item for item in listed(ha.ok("GET", path), key, what) if match(item)), None)
+    if found is None:
+        found = ha.ok("POST", path, body)
+        print(f"HolyArrs: {what} added")
+    if not isinstance(found, dict) or "id" not in found:
+        raise StepError(f"unexpected answer adding {what}: no id")
+    return found["id"]
+
+
+def setup_holyarrs(creds, qbit_login, jellyfin_key):
+    saved = creds.get("holyarrs", {})
+    if saved.get("done"):
+        print("HolyArrs: connected by an earlier run; left as it is")
+        return
     # Host: localhost is always accepted and saves nothing, with or without a proxy.
     ha = Client(HOLYARRS, host="localhost")
     state = ha.wait("/api/v1/auth/state")
-    saved = creds.get("holyarrs", {})
     if state.get("needs_setup"):
         login = remember(creds, "holyarrs", username="admin", password=new_password())
         me = ha.ok("POST", "/api/v1/auth/setup", {"name": login["username"], "password": login["password"]})
         print("HolyArrs: owner created")
     elif "password" in saved:
-        me = ha.ok("POST", "/api/v1/auth/login", {"name": saved["username"], "password": saved["password"]})
+        try:
+            me = ha.ok("POST", "/api/v1/auth/login", {"name": saved["username"], "password": saved["password"]})
+        except Refused:
+            print("HolyArrs: the saved password no longer works; left as it is")
+            return
     else:
         print("HolyArrs: has an owner this script did not make; left as it is")
         return
+    if not isinstance(me, dict) or not me.get("csrf"):
+        raise StepError("signing in did not return a session (is two-factor sign-in on?)")
     ha.headers["X-CSRF-Token"] = me["csrf"]
+    problems = []
 
-    folders = items(ha.ok("GET", "/api/v1/library-folders"), "folders", "library_folders")
     for path, kind, label, _ in FOLDERS:
-        if not any(f.get("path") == path for f in folders):
-            ha.ok("POST", "/api/v1/library-folders", {"path": path, "kind": kind, "label": label})
-            print(f"HolyArrs: library folder {path} added")
+        add_once(ha, "/api/v1/library-folders", "library_folders", f"library folder {path}",
+                 lambda f, path=path: f.get("path") == path, {"path": path, "kind": kind, "label": label})
 
-    if qbit:
-        found = items(ha.ok("GET", "/api/v1/downloaders"), "downloaders")
-        mine = next((d for d in found if d.get("kind") == "qbittorrent" and d.get("url") == QBITTORRENT), None)
-        if not mine:
-            mine = ha.ok("POST", "/api/v1/downloaders", {
-                "name": "qBittorrent", "kind": "qbittorrent", "url": QBITTORRENT, "username": qbit["username"],
-                "secret": qbit["password"], "category": "holyarrs", "allow_local_network": True})
-            mine = mine.get("downloader", mine)
-        test(ha, "/api/v1/downloaders", mine["id"], "qBittorrent")
+    local = []
+    if qbit_login:
+        local.append(("qBittorrent", "/api/v1/downloaders", add_once(
+            ha, "/api/v1/downloaders", "downloaders", "Downloader qBittorrent",
+            lambda d: d.get("kind") == "qbittorrent" and d.get("url") == QBITTORRENT,
+            {"name": "qBittorrent", "kind": "qbittorrent", "url": QBITTORRENT, "username": qbit_login["username"],
+             "secret": qbit_login["password"], "category": "holyarrs", "allow_local_network": True})))
     else:
-        print("HolyArrs: Downloader skipped (no saved qBittorrent password)")
-
+        print("HolyArrs: Downloader skipped (no working qBittorrent password)")
     if jellyfin_key:
-        found = items(ha.ok("GET", "/api/v1/media-servers"), "servers", "media_servers")
-        mine = next((m for m in found if m.get("kind") == "jellyfin" and m.get("url") == JELLYFIN), None)
-        if not mine:
-            mine = ha.ok("POST", "/api/v1/media-servers", {
-                "name": "Jellyfin", "kind": "jellyfin", "url": JELLYFIN, "token": jellyfin_key, "enabled": True,
-                "on_import": True, "on_rename": True, "on_delete": True, "allow_local_network": True})
-            mine = mine.get("server", mine.get("media_server", mine))
-        test(ha, "/api/v1/media-servers", mine["id"], "Jellyfin")
+        local.append(("Jellyfin", "/api/v1/media-servers", add_once(
+            ha, "/api/v1/media-servers", "media_servers", "media server Jellyfin",
+            lambda m: m.get("kind") == "jellyfin" and m.get("url") == JELLYFIN,
+            {"name": "Jellyfin", "kind": "jellyfin", "url": JELLYFIN, "token": jellyfin_key, "enabled": True,
+             "on_import": True, "on_rename": True, "on_delete": True, "allow_local_network": True})))
     else:
-        print("HolyArrs: media server skipped (no saved Jellyfin key)")
+        print("HolyArrs: media server skipped (no Jellyfin key)")
+    for name, path, ident in local:
+        passed, why = passes_test(ha, path, ident)
+        if passed:
+            print(f"HolyArrs: {name} passes Test")
+        else:
+            problems.append(f"{name} was added but fails HolyArrs' Test ({why})")
 
-    found = items(ha.ok("GET", "/api/v1/sources"), "sources")
     for site, name in SITES:
-        mine = next((s for s in found if s.get("site") == site), None)
-        if not mine:
-            mine = ha.ok("POST", "/api/v1/sources", {"name": name, "format": "site", "site": site})
-            mine = mine.get("source", mine)
-        test(ha, "/api/v1/sources", mine["id"], name)
+        ident = add_once(ha, "/api/v1/sources", "sources", f"source {name}",
+                         lambda s, site=site: s.get("site") == site, {"name": name, "format": "site", "site": site})
+        passed, why = passes_test(ha, "/api/v1/sources", ident)
+        # An outside site being down is not this install's fault: warn only.
+        print(f"HolyArrs: {name} passes Test" if passed else f"warn: HolyArrs: {name} does not answer right now ({why})")
 
     status, out = ha.call("POST", "/api/v1/auth/setup/done")
     if not 200 <= status < 300:
-        print(f"HolyArrs: could not mark first run as finished ({status}); finish it in the browser")
+        problems.append(f"could not mark the first run as finished ({status}: {str(out)[:120]})")
+    if problems:
+        raise StepError("; ".join(problems))
+    mark_done(creds, "holyarrs")
 
 
 def connect():
-    creds = load_creds()
+    try:
+        creds = load_creds()
+    except StepError as error:
+        print(f"FAIL setup: {error}", file=sys.stderr)
+        return 1
     failed = []
 
     def step(name, action):
         try:
             return action()
-        except (StepError, KeyError, TypeError) as error:
-            print(f"FAIL {name}: {error}", file=sys.stderr)
+        except Exception as error:  # one app's trouble must not stop the others
+            print(f"FAIL {name}: {type(error).__name__}: {error}", file=sys.stderr)
             failed.append(name)
             return None
 
-    qbit = step("qBittorrent", lambda: check_qbittorrent(creds))
+    holyarrs_done = creds.get("holyarrs", {}).get("done")
+    qbit_login = None if holyarrs_done else step("qBittorrent", lambda: check_qbittorrent(creds))
     jellyfin_key = step("Jellyfin", lambda: setup_jellyfin(creds))
-    step("HolyArrs", lambda: setup_holyarrs(creds, qbit, jellyfin_key))
+    step("HolyArrs", lambda: setup_holyarrs(creds, qbit_login, jellyfin_key))
     if creds_path().exists():
         print(f"Passwords and keys: {HOST_CONFIG_DIR}/stack-setup/credentials.json (root only)")
     if failed:
@@ -341,13 +421,16 @@ def connect():
 
 
 def main(argv):
-    if argv[1:] == ["seed"]:
-        seed()
-        return 0
-    if argv[1:] == ["connect"]:
+    if argv[1:] not in (["seed"], ["connect"]):
+        print("usage: setup.py seed|connect", file=sys.stderr)
+        return 2
+    # One run at a time: two overlapping runs would race on credentials.json.
+    with open(private_dir() / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if argv[1] == "seed":
+            seed()
+            return 0
         return connect()
-    print("usage: setup.py seed|connect", file=sys.stderr)
-    return 2
 
 
 if __name__ == "__main__":

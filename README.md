@@ -44,15 +44,18 @@ change a setting, copy `.env.example` to `.env` and keep only the lines you chan
    - Jellyfin gets its admin, the Movies and TV libraries, and an API key for HolyArrs.
    - HolyArrs gets its owner, its library folders, qBittorrent as its Downloader,
      Jellyfin as its media server, and the built-in Knaben and TorrentsCSV sources.
-     Each connection must pass HolyArrs' own Test.
+     qBittorrent and Jellyfin must pass HolyArrs' own Test. A torrent site that does
+     not answer at that moment only gets a warning.
 
 The generated passwords and keys are saved in
 `<CONFIG_DIR>/stack-setup/credentials.json`, readable by root only. `make credentials`
 shows the path. Sign in to each app with them, and change them if you like.
 
-Running `make up` again is safe. Anything already set up, by this script or by hand, is
-left as it is. A run that failed halfway picks up where it stopped. An app that was set
-up before this script is reported and skipped: connect it in HolyArrs' Settings yourself.
+Running `make up` again is safe. Once an app is connected it is marked done in that file
+and never touched again, so later changes you make in its settings stay. A run that
+failed halfway picks up where it stopped. An app that was set up before this script, or
+whose generated password you changed before the connection finished, is reported and
+skipped: connect it in HolyArrs' Settings yourself.
 
 ## What stays manual
 
