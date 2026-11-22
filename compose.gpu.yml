@@ -1,0 +1,8 @@
+# Hardware transcoding for Jellyfin. make adds this file when the host has
+# /dev/dri/renderD128 and passes that device's group as RENDER_GID.
+services:
+  jellyfin:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:?RENDER_GID must be the group of /dev/dri/renderD128}"
