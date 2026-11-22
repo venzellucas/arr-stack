@@ -88,18 +88,17 @@ services:
       start_period: 60s
 
   updater:
-    # Pulls new images for the three apps on a schedule and restarts the ones
-    # that changed. It never updates itself; `make up` does that. HolyArrs
-    # backs up its own data before an update that changes it.
+    # Optional: COMPOSE_PROFILES=updater in .env. Pulls new images for the three
+    # apps on a schedule and restarts the ones that changed. It never updates
+    # itself; `make up` does. HolyArrs backs up its own data before an update
+    # that changes it. It reads the same .env through the /stack mount.
     <<: *app
     image: docker:cli
     container_name: media-updater
+    profiles: [updater]
     environment:
       - TZ=${TZ:-Etc/UTC}
       - UPDATE_SCHEDULE=${UPDATE_SCHEDULE:-0 5 * * 0}
-      # Set by make, so updates keep the same files (e.g. the GPU override).
-      - COMPOSE_FILE=${COMPOSE_FILE:-docker-compose.yml}
-      - RENDER_GID=${RENDER_GID:-}
     working_dir: /stack
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -109,3 +108,20 @@ services:
       - >-
         echo "$$UPDATE_SCHEDULE /bin/sh /stack/scripts/update.sh >/proc/1/fd/1 2>&1" | crontab - &&
         exec crond -f -l 6
+
+  setup:
+    # Run by `make up`: connects the three apps on a fresh install and leaves
+    # anything already set up alone. See scripts/setup.py.
+    image: python:3-alpine
+    profiles: [setup]
+    logging: *logging
+    networks: [media]
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - CONFIG_DIR=${CONFIG_DIR:-/opt/appdata}
+    volumes:
+      - ./scripts:/scripts:ro
+      - ${CONFIG_DIR:-/opt/appdata}:/appdata
+      - ${DATA_DIR:-/data}:/data
+    entrypoint: ["python3", "/scripts/setup.py"]

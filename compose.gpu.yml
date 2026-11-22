@@ -1,8 +1,9 @@
-# Hardware transcoding for Jellyfin. make adds this file when the host has
-# /dev/dri/renderD128 and passes that device's group as RENDER_GID.
+# Hardware transcoding for Jellyfin. Switch it on in .env:
+#   COMPOSE_FILE=docker-compose.yml:compose.gpu.yml
+#   RENDER_GID=<group of /dev/dri/renderD128, see: stat -c %g /dev/dri/renderD128>
 services:
   jellyfin:
     devices:
       - /dev/dri:/dev/dri
     group_add:
-      - "${RENDER_GID:?RENDER_GID must be the group of /dev/dri/renderD128}"
+      - "${RENDER_GID:?set RENDER_GID in .env to the group of /dev/dri/renderD128}"

@@ -46,13 +46,29 @@ post() {
     done
     ok "$name is healthy"
   done
-  [ "$(docker inspect -f '{{.State.Running}}' media-updater 2>/dev/null)" = true ] || fail "media-updater is not running"
-  ok "media-updater is running (schedule: $(setting UPDATE_SCHEDULE '0 5 * * 0'))"
+  if updater_on; then
+    [ "$(docker inspect -f '{{.State.Running}}' media-updater 2>/dev/null)" = true ] || fail "media-updater is not running"
+    ok "media-updater is running (schedule: $(setting UPDATE_SCHEDULE '0 5 * * 0'))"
+  else
+    ok "updater is off (COMPOSE_PROFILES=updater in .env turns it on)"
+  fi
+}
+
+# The updater is on when COMPOSE_PROFILES in .env lists it.
+updater_on() {
+  case ",$(setting COMPOSE_PROFILES '')," in *,updater,*) return 0 ;; *) return 1 ;; esac
+}
+
+credentials() {
+  file="$(setting CONFIG_DIR /opt/appdata)/stack-setup/credentials.json"
+  if [ -f "$file" ]; then echo "$file"; else echo "no credentials yet ($file); run make up"; fi
 }
 
 case "${1:-all}" in
   pre) pre ;;
   post) post ;;
   all) pre; post ;;
-  *) fail "usage: $0 [pre|post|all]" ;;
+  updater-on) updater_on ;;
+  credentials) credentials ;;
+  *) fail "usage: $0 [pre|post|all|updater-on|credentials]" ;;
 esac
