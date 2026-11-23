@@ -42,7 +42,7 @@ class Isolated(unittest.TestCase):
     """Points the setup at a temporary folder, never the host's, and restores it after."""
 
     def setUp(self):
-        self.saved_globals = setup.APPDATA, setup.DATA, setup.PUID, setup.PGID
+        self.saved_globals = setup.APPDATA, setup.DATA, setup.PUID, setup.PGID, setup.HOST_DATA_DIR
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         setup.APPDATA, setup.DATA = root / "appdata", root / "data"
@@ -50,7 +50,7 @@ class Isolated(unittest.TestCase):
         setup.PUID, setup.PGID = os.getuid(), os.getgid()
 
     def tearDown(self):
-        setup.APPDATA, setup.DATA, setup.PUID, setup.PGID = self.saved_globals
+        setup.APPDATA, setup.DATA, setup.PUID, setup.PGID, setup.HOST_DATA_DIR = self.saved_globals
         self.tmp.cleanup()
 
 
@@ -111,6 +111,32 @@ class HelperTests(Isolated):
             setup.load_creds()
         self.assertEqual(setup.main(["setup.py", "connect"]), 1)
         self.assertEqual(setup.main(["setup.py", "seed"]), 1)
+
+    def test_a_data_folder_root_cannot_use_is_a_clear_failure(self):
+        setup.HOST_DATA_DIR = "/srv/media-data"
+        real_mkdir = Path.mkdir
+
+        def refuse_mkdir(path, *args, **kwargs):
+            if str(path).startswith(str(setup.DATA)):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_mkdir(path, *args, **kwargs)
+
+        def refuse_chown(path, *args):
+            raise PermissionError(1, "Operation not permitted", str(path))
+
+        for name, patch in (("mkdir", mock.patch.object(Path, "mkdir", refuse_mkdir)),
+                            ("chown", mock.patch.object(setup.os, "chown", refuse_chown))):
+            with self.subTest(name), patch, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(setup.main(["setup.py", "seed"]), 1)
+            self.assertIn("FAIL setup: /srv/media-data/downloads: ", err.getvalue())
+            self.assertIn("root_squash", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_host_path_names_the_hosts_folders(self):
+        setup.HOST_DATA_DIR = "/srv/media-data"
+        self.assertEqual(setup.host_path(str(setup.DATA / "media/tv")), "/srv/media-data/media/tv")
+        self.assertEqual(setup.host_path(str(setup.APPDATA / "qbittorrent")), setup.HOST_CONFIG_DIR + "/qbittorrent")
+        self.assertEqual(setup.host_path(str(setup.DATA) + "-other"), str(setup.DATA) + "-other")
 
     def test_whole_writes_leave_no_temporary_files(self):
         setup.save_creds({"a": 1})

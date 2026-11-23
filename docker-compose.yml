@@ -120,6 +120,7 @@ services:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
       - CONFIG_DIR=${CONFIG_DIR:-/opt/appdata}
+      - DATA_DIR=${DATA_DIR:-/data}
     volumes:
       - ./scripts:/scripts:ro
       - ${CONFIG_DIR:-/opt/appdata}:/appdata

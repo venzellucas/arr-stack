@@ -31,7 +31,8 @@ from pathlib import Path
 
 APPDATA = Path("/appdata")
 DATA = Path("/data")
-HOST_CONFIG_DIR = os.environ.get("CONFIG_DIR", "/opt/appdata")
+HOST_CONFIG_DIR = os.environ.get("CONFIG_DIR", "/opt/appdata")  # for messages: the host's paths
+HOST_DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PUID = int(os.environ.get("PUID", "1000"))
 PGID = int(os.environ.get("PGID", "1000"))
 
@@ -463,21 +464,35 @@ def connect():
     return 1 if failed else 0
 
 
+def host_path(path):
+    """The host's name for a path inside this container."""
+    for inside, outside in ((str(APPDATA), HOST_CONFIG_DIR), (str(DATA), HOST_DATA_DIR)):
+        if path == inside or path.startswith(inside + "/"):
+            return outside + path[len(inside):]
+    return path
+
+
 def main(argv):
     if argv[1:] not in (["seed"], ["connect"]):
         print("usage: setup.py seed|connect", file=sys.stderr)
         return 2
-    # One run at a time: two overlapping runs would race on credentials.json.
-    with open(private_dir() / ".lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
+    try:
+        # One run at a time: two overlapping runs would race on credentials.json.
+        with open(private_dir() / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             if argv[1] == "seed":
                 seed()
                 return 0
             return connect()
-        except StepError as error:
-            print(f"FAIL setup: {error}", file=sys.stderr)
-            return 1
+    except StepError as error:
+        print(f"FAIL setup: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        where = host_path(str(error.filename)) if error.filename else "a file"
+        print(f"FAIL setup: {where}: {error.strerror or error}. Setup runs as root and must be able to "
+              f"create folders there and give them to PUID {PUID} (NFS with root_squash and CIFS refuse this)",
+              file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
