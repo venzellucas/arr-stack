@@ -38,8 +38,8 @@ change a setting, copy `.env.example` to `.env` and keep only the lines you chan
 
 ## What `make up` does
 
-1. Checks that Docker and Compose work and that the data folder is writable and on one
-   filesystem.
+1. Checks that Docker and Compose work, and that the data folder exists, is on one
+   filesystem and belongs to the apps' user (`PUID`; a warning otherwise).
 2. Makes `downloads`, `media/movies` and `media/tv` in the data folder, and gives a new
    qBittorrent a generated password with downloads going to `/data/downloads`.
 3. Starts the containers and waits until each app answers.

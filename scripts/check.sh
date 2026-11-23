@@ -33,16 +33,17 @@ pre() {
   pgid=$(setting PGID 1000)
   create="sudo install -d -o $puid -g $pgid $data"
   [ -d "$data" ] || fail "$data does not exist; create it for the apps' user ($create), or set DATA_DIR in .env"
-  [ -w "$data" ] || fail "$data is not writable; give it to the apps' user (sudo chown $puid:$pgid $data)"
   # Downloads and media must share one filesystem, or imports are full copies.
   dev=$(stat -c %d "$data")
   for dir in "$data"/*/; do
     [ -d "$dir" ] || continue
     [ "$(stat -c %d "$dir")" = "$dev" ] || fail "$dir is a separate filesystem from $data; hardlinks between downloads and media will not work"
   done
+  # The apps run as PUID; setup gives the folders it makes inside to PUID too.
+  # Who runs make does not matter, so its own write access is not checked.
   owner=$(stat -c %u "$data")
-  [ "$owner" = "$puid" ] || echo "warn: $data belongs to uid $owner, but the apps run as PUID $puid"
-  ok "$data is writable and on one filesystem"
+  [ "$owner" = "$puid" ] || echo "warn: $data belongs to uid $owner, but the apps run as PUID $puid (sudo chown $puid:$pgid $data)"
+  ok "$data is on one filesystem"
 }
 
 post() {
