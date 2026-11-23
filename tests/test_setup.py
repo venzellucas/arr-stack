@@ -295,7 +295,11 @@ class ConnectTests(Isolated):
             self.assertEqual(setup.connect(), 0)
         creds = self.creds()
         self.assertTrue(creds["jellyfin"]["left_alone"] and creds["holyarrs"]["left_alone"])
-        self.assertIn("Connect it in HolyArrs' Settings yourself", out.getvalue())
+        lines = out.getvalue().splitlines()
+        self.assertIn("Jellyfin: the saved password was refused (changed by hand?); left as it is from now on. "
+                      "Add it as a media server in HolyArrs' Settings yourself", lines)
+        self.assertIn("HolyArrs: the saved password was refused (changed by hand?); left as it is from now on. "
+                      "Add its library folders, Downloader, media server and sources in its Settings yourself", lines)
         self.assertNotIn("credentials.json", out.getvalue().replace(
             setup.HOST_CONFIG_DIR + "/stack-setup/credentials.json (root only)", ""))
         self.apps.calls.clear()

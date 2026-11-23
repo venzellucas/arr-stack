@@ -19,16 +19,19 @@ Use it only with content you have the right to download and share.
 - Free ports: 6262 (HolyArrs), 8080 (qBittorrent), 8096 (Jellyfin) and the torrent port
   (6881 by default).
 
-Nothing here installs packages, mounts disks or changes the host. `make` only checks.
+Nothing here installs packages, mounts disks or changes the host outside `DATA_DIR` and
+`CONFIG_DIR`.
 
 ## Install
 
 ```sh
 git clone https://github.com/venzellucas/arr-stack.git
 cd arr-stack
-sudo mkdir -p /data            # or point DATA_DIR at your own folder in .env
+sudo install -d -o 1000 -g 1000 /data   # the apps' user; or set DATA_DIR in .env
 make up
 ```
+
+If you set other `PUID`/`PGID` values in `.env`, give the data folder to that user instead.
 
 Settings come only from `.env`. Without one, every default in `.env.example` applies. To
 change a setting, copy `.env.example` to `.env` and keep only the lines you change.
@@ -49,7 +52,9 @@ change a setting, copy `.env.example` to `.env` and keep only the lines you chan
 
 The generated passwords and keys are saved in
 `<CONFIG_DIR>/stack-setup/credentials.json`, readable by root only. `make credentials`
-shows the path. Sign in to each app with them, and change them if you like.
+shows the path. Sign in to each app with them, and change them if you like. HolyArrs keeps
+its own copy of the qBittorrent password: after changing it in qBittorrent, enter the new
+one in HolyArrs' Settings > Downloaders too.
 
 Running `make up` again is safe. Once an app is connected it is marked done in that file
 and never touched again, so later changes you make in its settings stay. A run that

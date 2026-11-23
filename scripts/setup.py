@@ -126,15 +126,14 @@ def mark_done(creds, app):
     save_creds(creds)
 
 
-def leave_alone(creds, app, name):
+def leave_alone(creds, app, name, todo):
     """Remember that app refused its saved password, so no later run signs in again.
 
     Repeated failed sign-ins lock accounts (Jellyfin) or ban the address (qBittorrent).
     """
     creds.setdefault(app, {})["left_alone"] = True
     save_creds(creds)
-    print(f"{name}: the saved password was refused (changed by hand?); left as it is from now on. "
-          f"Connect it in HolyArrs' Settings yourself")
+    print(f"{name}: the saved password was refused (changed by hand?); left as it is from now on. {todo}")
 
 
 def skipped(saved, name):
@@ -285,7 +284,7 @@ def check_qbittorrent(creds):
         print("qBittorrent: signs in with the generated password")
         return login
     if status == 401 or (status == 200 and answer == "Fails."):
-        leave_alone(creds, "qbittorrent", "qBittorrent")
+        leave_alone(creds, "qbittorrent", "qBittorrent", "Add it as a Downloader in HolyArrs' Settings yourself")
         return None
     raise StepError(f"qBittorrent sign-in answered {status}: {answer[:120]}")
 
@@ -319,7 +318,7 @@ def setup_jellyfin(creds):
     try:
         auth = jf.ok("POST", "/Users/AuthenticateByName", {"Username": login["username"], "Pw": login["password"]})
     except Refused:
-        leave_alone(creds, "jellyfin", "Jellyfin")
+        leave_alone(creds, "jellyfin", "Jellyfin", "Add it as a media server in HolyArrs' Settings yourself")
         return None
     jf = jellyfin_client(auth["AccessToken"])
     if not login.get("api_key"):
@@ -380,7 +379,8 @@ def setup_holyarrs(creds, jellyfin_key, jellyfin_failed=False):
         try:
             me = ha.ok("POST", "/api/v1/auth/login", {"name": saved["username"], "password": saved["password"]})
         except Refused:
-            leave_alone(creds, "holyarrs", "HolyArrs")
+            leave_alone(creds, "holyarrs", "HolyArrs",
+                        "Add its library folders, Downloader, media server and sources in its Settings yourself")
             return
     else:
         print("HolyArrs: has an owner this script did not make; left as it is")

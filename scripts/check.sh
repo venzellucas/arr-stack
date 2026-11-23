@@ -29,15 +29,17 @@ pre() {
   ok "Docker $(docker version -f '{{.Server.Version}}'), $(docker compose version --short 2>/dev/null || echo compose)"
 
   data=$(setting DATA_DIR /data)
-  [ -d "$data" ] || fail "$data does not exist; create it (downloads and media inside it), or set DATA_DIR in .env"
-  [ -w "$data" ] || fail "$data is not writable"
+  puid=$(setting PUID 1000)
+  pgid=$(setting PGID 1000)
+  create="sudo install -d -o $puid -g $pgid $data"
+  [ -d "$data" ] || fail "$data does not exist; create it for the apps' user ($create), or set DATA_DIR in .env"
+  [ -w "$data" ] || fail "$data is not writable; give it to the apps' user (sudo chown $puid:$pgid $data)"
   # Downloads and media must share one filesystem, or imports are full copies.
   dev=$(stat -c %d "$data")
   for dir in "$data"/*/; do
     [ -d "$dir" ] || continue
     [ "$(stat -c %d "$dir")" = "$dev" ] || fail "$dir is a separate filesystem from $data; hardlinks between downloads and media will not work"
   done
-  puid=$(setting PUID 1000)
   owner=$(stat -c %u "$data")
   [ "$owner" = "$puid" ] || echo "warn: $data belongs to uid $owner, but the apps run as PUID $puid"
   ok "$data is writable and on one filesystem"
